@@ -1,13 +1,20 @@
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
+#include <chrono>
+
 namespace
 {
-    constexpr auto kWantRight = "bWantCastRight";
-    constexpr auto kWantLeft  = "bWantCastLeft";
+    using Clock = std::chrono::steady_clock;
 
-    bool g_ownsRight = false;
-    bool g_ownsLeft = false;
+    bool g_injecting = false;
+    bool g_primaryDown = false;
+    bool g_secondaryDown = false;
+    bool g_dualDown = false;
+
+    Clock::time_point g_primaryStart{};
+    Clock::time_point g_secondaryStart{};
+    Clock::time_point g_dualStart{};
 
     bool IsSpellEquipped(RE::PlayerCharacter* player, bool leftHand)
     {
@@ -16,32 +23,44 @@ namespace
         }
 
         auto* form = player->GetEquippedObject(leftHand);
-        return form && form->GetFormType() == RE::FormType::Spell;
+        return form && form->GetSavedFormType() == RE::FormType::Spell;
     }
 
-    void SetWanted(RE::PlayerCharacter* player, const char* variable, bool value)
+    float HeldSeconds(const Clock::time_point& start)
     {
-        if (player) {
-            player->SetGraphVariableBool(RE::BSFixedString(variable), value);
-        }
+        const auto elapsed = std::chrono::duration<float>(Clock::now() - start).count();
+        return elapsed < 0.01f ? 0.01f : elapsed;
     }
 
-    void ClearOwnedState(RE::PlayerCharacter* player)
+    void SendButton(const RE::BSFixedString& userEvent, std::uint32_t idCode, bool down, float heldSecs = 0.0f)
     {
-        if (!player) {
-            g_ownsRight = false;
-            g_ownsLeft = false;
+        auto* input = RE::BSInputDeviceManager::GetSingleton();
+        if (!input) {
             return;
         }
 
-        if (g_ownsRight) {
-            SetWanted(player, kWantRight, false);
-            g_ownsRight = false;
+        auto* event = RE::ButtonEvent::Create(
+            RE::INPUT_DEVICE::kMouse,
+            userEvent,
+            idCode,
+            down ? 1.0f : 0.0f,
+            heldSecs);
+
+        if (!event) {
+            return;
         }
-        if (g_ownsLeft) {
-            SetWanted(player, kWantLeft, false);
-            g_ownsLeft = false;
-        }
+
+        RE::InputEvent* eventPtr = event;
+        g_injecting = true;
+        input->SendEvent(&eventPtr);
+        g_injecting = false;
+    }
+
+    void ResetState()
+    {
+        g_primaryDown = false;
+        g_secondaryDown = false;
+        g_dualDown = false;
     }
 
     class MountedCastingInput final : public RE::BSTEventSink<RE::InputEvent*>
@@ -51,23 +70,18 @@ namespace
             RE::InputEvent* const* events,
             RE::BSTEventSource<RE::InputEvent*>*) override
         {
-            if (!events) {
+            if (!events || g_injecting) {
                 return RE::BSEventNotifyControl::kContinue;
             }
 
             auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player) {
-                return RE::BSEventNotifyControl::kContinue;
-            }
-
-            // Never touch normal on-foot casting.
-            if (!player->IsOnMount()) {
-                ClearOwnedState(player);
-                return RE::BSEventNotifyControl::kContinue;
-            }
-
             auto* userEvents = RE::UserEvents::GetSingleton();
-            if (!userEvents) {
+            if (!player || !userEvents) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            if (!player->IsOnMount()) {
+                ResetState();
                 return RE::BSEventNotifyControl::kContinue;
             }
 
@@ -82,53 +96,85 @@ namespace
                 }
 
                 const auto& userEvent = button->QUserEvent();
+                const auto idCode = button->GetIDCode();
 
-                // Skyrim names the primary/LMB action "leftAttack", but it drives
-                // the RIGHT hand. The secondary/RMB action drives the LEFT hand.
-                if (userEvent == userEvents->leftAttack) {
-                    if (button->IsDown()) {
+                // Prefer the physical mouse buttons so this still works when
+                // mounted spell combat has no normal attack user-event mapping.
+                const bool primary =
+                    (button->device == RE::INPUT_DEVICE::kMouse &&
+                     idCode == static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kLeftButton)) ||
+                    userEvent == userEvents->leftAttack;
+
+                const bool secondary =
+                    (button->device == RE::INPUT_DEVICE::kMouse &&
+                     idCode == static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kRightButton)) ||
+                    userEvent == userEvents->rightAttack;
+
+                if (!primary && !secondary) {
+                    continue;
+                }
+
+                if (button->IsDown()) {
+                    if (primary && !g_primaryDown) {
+                        g_primaryDown = true;
+                        g_primaryStart = Clock::now();
+
                         if (IsSpellEquipped(player, false)) {
-                            SetWanted(player, kWantRight, true);
-                            g_ownsRight = true;
-                        }
-                    } else if (button->IsUp()) {
-                        if (g_ownsRight) {
-                            SetWanted(player, kWantRight, false);
-                            g_ownsRight = false;
+                            SendButton(
+                                userEvents->leftAttack,
+                                static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kLeftButton),
+                                true);
                         }
                     }
-                } else if (userEvent == userEvents->rightAttack) {
-                    if (button->IsDown()) {
+
+                    if (secondary && !g_secondaryDown) {
+                        g_secondaryDown = true;
+                        g_secondaryStart = Clock::now();
+
                         if (IsSpellEquipped(player, true)) {
-                            SetWanted(player, kWantLeft, true);
-                            g_ownsLeft = true;
-                        }
-                    } else if (button->IsUp()) {
-                        if (g_ownsLeft) {
-                            SetWanted(player, kWantLeft, false);
-                            g_ownsLeft = false;
+                            SendButton(
+                                userEvents->rightAttack,
+                                static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kRightButton),
+                                true);
                         }
                     }
-                } else if (userEvent == userEvents->dualAttack) {
-                    // Some input paths/controllers can surface Skyrim's synthetic
-                    // "Dual Attack" user event directly. Supporting it costs nothing
-                    // and keeps the bridge compatible with remapped controls.
-                    if (button->IsDown()) {
-                        if (IsSpellEquipped(player, false) && IsSpellEquipped(player, true)) {
-                            SetWanted(player, kWantRight, true);
-                            SetWanted(player, kWantLeft, true);
-                            g_ownsRight = true;
-                            g_ownsLeft = true;
+
+                    if (g_primaryDown && g_secondaryDown && !g_dualDown &&
+                        IsSpellEquipped(player, false) && IsSpellEquipped(player, true)) {
+                        g_dualDown = true;
+                        g_dualStart = Clock::now();
+
+                        SendButton(userEvents->dualAttack, 0, true);
+                    }
+                } else if (button->IsUp()) {
+                    // Match DualCastHotkey's charge/release behaviour: releases
+                    // carry the real held duration so concentration/charged
+                    // spells are handled by Skyrim instead of being force-cast.
+                    if (primary && g_primaryDown) {
+                        if (IsSpellEquipped(player, false)) {
+                            SendButton(
+                                userEvents->leftAttack,
+                                static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kLeftButton),
+                                false,
+                                HeldSeconds(g_primaryStart));
                         }
-                    } else if (button->IsUp()) {
-                        if (g_ownsRight) {
-                            SetWanted(player, kWantRight, false);
-                            g_ownsRight = false;
+                        g_primaryDown = false;
+                    }
+
+                    if (secondary && g_secondaryDown) {
+                        if (IsSpellEquipped(player, true)) {
+                            SendButton(
+                                userEvents->rightAttack,
+                                static_cast<std::uint32_t>(RE::BSWin32MouseDevice::Key::kRightButton),
+                                false,
+                                HeldSeconds(g_secondaryStart));
                         }
-                        if (g_ownsLeft) {
-                            SetWanted(player, kWantLeft, false);
-                            g_ownsLeft = false;
-                        }
+                        g_secondaryDown = false;
+                    }
+
+                    if (g_dualDown && (!g_primaryDown || !g_secondaryDown)) {
+                        SendButton(userEvents->dualAttack, 0, false, HeldSeconds(g_dualStart));
+                        g_dualDown = false;
                     }
                 }
             }
@@ -144,7 +190,6 @@ namespace
         if (message && message->type == SKSE::MessagingInterface::kInputLoaded) {
             if (auto* input = RE::BSInputDeviceManager::GetSingleton()) {
                 input->AddEventSink(&g_input);
-                SKSE::log::info("Mounted casting input bridge active");
             }
         }
     }
