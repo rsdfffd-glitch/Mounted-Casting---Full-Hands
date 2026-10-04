@@ -1,0 +1,54 @@
+name: Build Skyrim plugin
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+
+      - name: Clone vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+          C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+
+      - name: Configure
+        shell: pwsh
+        env:
+          VCPKG_ROOT: C:\vcpkg
+        run: |
+          cmake -B build -S . -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Assemble MO2 package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package\SKSE\Plugins | Out-Null
+          Copy-Item build\MountedCastingBridge.dll package\SKSE\Plugins\MountedCastingBridge.dll
+          Copy-Item mod\* package\ -Recurse -Force
+          Compress-Archive -Path package\* -DestinationPath MountedCasting_FullHands_MO2.zip -Force
+
+      - name: Upload MO2 package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MountedCasting-FullHands-MO2
+          path: MountedCasting_FullHands_MO2.zip
