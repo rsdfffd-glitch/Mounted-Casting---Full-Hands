@@ -1,0 +1,10 @@
+		<hkobject name="#amc$28" class="hkbManualSelectorGenerator" signature="0xd932fab8">
+			<hkparam name="variableBindingSet">#amc$27</hkparam>
+			<hkparam name="userData">0</hkparam>
+			<hkparam name="name">ZAR_MCAimMagicLocomotion_MSG</hkparam>
+			<hkparam name="generators" numelements="13">
+				#0619 #0619 #0619 #0619 #0619 #0619 #0619 #0619 #amc$26 #amc$26 #0619 #0619 #0619
+			</hkparam>
+			<hkparam name="selectedGeneratorIndex">0</hkparam>
+			<hkparam name="currentGeneratorIndex">0</hkparam>
+		</hkobject>
